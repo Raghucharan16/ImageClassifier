@@ -1,0 +1,8 @@
+# Offline document classifier — runtime dependencies (no internet needed).
+# RapidOCR ships its English/Latin ONNX models INSIDE the wheel, so nothing
+# is downloaded at runtime. PaddlePaddle / PaddleOCR are NOT required.
+rapidocr-onnxruntime==1.4.4
+onnxruntime==1.27.0
+opencv-python>=4.8
+pillow>=10.0
+numpy>=1.24

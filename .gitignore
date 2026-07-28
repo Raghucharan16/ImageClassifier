@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# PyInstaller build artefacts
+docpipeline/build/
+docpipeline/dist/
+
+# Large model files (downloaded at runtime or via HuggingFace cache)
+*.onnx
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Compiled EXE (too large for git)
+*.exe
+
+# Scan images and output (not source code)
+Images/
+OutputImages/
+TotalImages/
+sampleimages/
+sampleoutput/
+output/
+stage1_output/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

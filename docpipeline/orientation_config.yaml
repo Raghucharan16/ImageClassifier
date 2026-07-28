@@ -1,0 +1,19 @@
+# Session options for the bundled rapid-orientation ONNX classifier.
+#
+# The thread caps are the important part: enhancement runs one model instance
+# per worker thread, and onnxruntime's default is to size its own intra-op pool
+# from the whole machine. Eight instances each grabbing every core oversubscribes
+# the CPU badly (measured ~2.3s of worker-time per page against a ~0.5s
+# single-threaded cost). One thread per instance leaves the parallelism to our
+# own worker pool, which is where we can actually control it.
+model_path: models/rapid_orientation.onnx
+
+use_cuda: false
+intra_op_num_threads: 1
+inter_op_num_threads: 1
+
+CUDAExecutionProvider:
+    device_id: 0
+    arena_extend_strategy: kNextPowerOfTwo
+    cudnn_conv_algo_search: EXHAUSTIVE
+    do_copy_in_default_stream: true
