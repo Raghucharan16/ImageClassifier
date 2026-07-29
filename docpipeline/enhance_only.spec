@@ -19,6 +19,8 @@ datas = [
     (str(PIPE / "orientation_config.yaml"), "."),
     # rapidocr models (shipped inside its wheel)
     (str(VENV / "Lib/site-packages/rapidocr_onnxruntime"), "rapidocr_onnxruntime"),
+    # zxing-cpp native lib (barcode detection for separator pages)
+    (str(VENV / "Lib/site-packages/zxingcpp"), "zxingcpp"),
 ]
 
 block_cipher = None
@@ -38,6 +40,7 @@ a = Analysis(
         "cv2",
         "numpy",
         "yaml",
+        "zxingcpp",
         "tkinter",
         "tkinter.filedialog",
         "tkinter.messagebox",
