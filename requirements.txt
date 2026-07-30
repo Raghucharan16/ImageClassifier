@@ -1,0 +1,35 @@
+# LIC document pipeline - shared dependencies (CPU and GPU alike).
+#
+# This file deliberately does NOT pin an onnxruntime build. All three
+# distributions (onnxruntime, onnxruntime-gpu, onnxruntime-directml) install the
+# same importable `onnxruntime` package, so installing two of them leaves a
+# half-overwritten mixture whose available providers depend on which was
+# unpacked last. Pick exactly one:
+#
+#     pip install -r requirements.txt
+#     pip install -r requirements-gpu.txt     # NVIDIA GPU present
+#     pip install -r requirements-cpu.txt     # no NVIDIA GPU
+#
+# Or let it be decided for you, which also repairs an existing broken mixture:
+#
+#     python setup_runtime.py
+#
+# The pipeline detects at startup which provider it actually got, so the same
+# code runs on either machine with no flags (see ocr_engine.cuda_available).
+
+# --- OCR / models -----------------------------------------------------------
+rapidocr-onnxruntime==1.4.4   # PP-OCRv4 det+rec+cls, bundled ONNX, fully offline
+rapid-orientation==0.0.11     # page orientation classifier (0/90/180/270)
+
+# --- imaging ----------------------------------------------------------------
+opencv-python>=4.8
+numpy>=1.24
+Pillow>=10.0                 # also supplies TiffImagePlugin.AppendingTiffWriter,
+                             # used to put the colour photo and the Group4 text
+                             # pages in ONE proposal TIFF with per-page codecs
+
+# --- barcode separator detection -------------------------------------------
+zxing-cpp>=2.2               # reads the separator sheets that split applications
+
+# --- packaging (build the standalone EXEs; not needed at runtime) -----------
+pyinstaller>=6.0

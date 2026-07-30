@@ -1,17 +1,29 @@
 """
 Standalone enhancement runner - entry point for enhance.exe.
 
+Stage 2 of the pipeline: it consumes scan.exe's OUTPUT, which has already
+grouped the pages into applications, so no barcode work happens here.
+
+Input (produced by scan.exe):
+    <input>/
+        APP_01/   00000002.tif  00000004.tif  ...
+        APP_02/   00000036.tif  ...
+        scan_summary.json       <- records the original raw scan folder
+
 Workflow
 --------
-1. Scans raw TIF files in the input folder.
-2. Detects barcode separator pages (>= 2 barcodes = separator).
-3. Groups pages into applications -> creates APP_01/, APP_02/... in output.
-4. Enhances each TIF and saves it directly into its APP folder.
-5. Always writes side-by-side before|after preview JPGs in output/previews/.
-6. Blank pages go to output/skipped_blank/ (originals, for review).
+1. Reads the APP_xx folders from the input directory.
+2. Recovers the ORIGINAL raw scan folder from scan_summary.json -- scan.exe
+   copies only TIFs, so the paired colour JPGs (needed to rebuild dark ID-card
+   photocopies, and later to crop the applicant photo) are still back there.
+3. Enhances each TIF into the matching APP folder under output.
+4. Always writes side-by-side before|after preview JPGs in output/previews/.
+5. Blank pages go to output/skipped_blank/ (originals, for review).
+6. Writes manifest.json recording the RAW scan folder, which index.exe reads to
+   find the JPG for the applicant-photo crop.
 
 CLI:
-    enhance.exe --input <scan folder> --output <output folder>
+    enhance.exe --input <scan.exe output folder> --output <output folder>
 
 Double-click: opens folder-picker dialogs.
 """
@@ -36,7 +48,6 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
-from PIL import Image as PILImage
 
 import enhance as E
 
@@ -50,53 +61,42 @@ def default_workers(cpu=None):
     return max(4, min(8, cpu - 1))
 
 
-# ---------------------------------------------------------------- barcode scan
-def _barcode_count(path: str, max_side: int = 1600) -> int:
-    """Return number of barcodes found on this page (fast, no OCR)."""
+# ---------------------------------------------------------------- scan.exe input
+def _read_app_folders(in_dir: str) -> dict[str, list[str]]:
+    """{APP_xx: [tif filenames]} from scan.exe's output folder."""
+    apps: dict[str, list[str]] = {}
+    for d in sorted(os.listdir(in_dir)):
+        p = os.path.join(in_dir, d)
+        if not (os.path.isdir(p) and d.startswith("APP_")):
+            continue
+        apps[d] = sorted(f for f in os.listdir(p) if f.lower().endswith(E.DOC_EXT))
+    return apps
+
+
+def _raw_scan_dir(in_dir: str) -> str | None:
+    """The ORIGINAL raw scan folder, recorded by scan.exe in scan_summary.json.
+
+    Needed because scan.exe copies only TIFs into its APP folders. The paired
+    colour JPGs stay behind, and they are what rebuild_from_photo uses to
+    recover an unreadable dark ID-card photocopy, and what index.exe later
+    crops the applicant photo from.
+    """
+    p = os.path.join(in_dir, "scan_summary.json")
+    if not os.path.exists(p):
+        logging.warning("scan_summary.json not found -- paired JPGs unavailable, "
+                        "so dark ID-card pages cannot be rebuilt and photo.jpg "
+                        "will be skipped later")
+        return None
     try:
-        import zxingcpp
-    except ImportError:
-        return 0
-    try:
-        g = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-        if g is None:
-            g = np.array(PILImage.open(path).convert("L"))
-        s = max_side / max(g.shape[:2])
-        if s < 1:
-            g = cv2.resize(g, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-        return len(zxingcpp.read_barcodes(g))
-    except Exception:
-        return 0
-
-
-def _find_groups(in_dir: str, tifs: list[str], workers: int) -> list[list[str]]:
-    """Detect separator pages and split TIF list into per-application groups."""
-    logging.info("Scanning for application separators (barcode pages)...")
-
-    def _job(f):
-        return f, _barcode_count(os.path.join(in_dir, f))
-
-    separators: set[str] = set()
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        for f, n in ex.map(_job, tifs):
-            if n >= 2:
-                separators.add(f)
-
-    groups: list[list[str]] = []
-    cur: list[str] = []
-    for f in tifs:
-        if f in separators:
-            if cur:
-                groups.append(cur)
-            cur = []
-        else:
-            cur.append(f)
-    if cur:
-        groups.append(cur)
-
-    logging.info(f"  {len(separators)} separators -> {len(groups)} applications "
-                 f"(sizes: {[len(g) for g in groups]})")
-    return groups
+        with open(p, encoding="utf-8") as fh:
+            raw = json.load(fh).get("input")
+    except Exception as exc:
+        logging.warning(f"could not read scan_summary.json: {exc}")
+        return None
+    if raw and os.path.isdir(raw):
+        return raw
+    logging.warning(f"raw scan folder from scan_summary.json is missing: {raw}")
+    return None
 
 
 # ---------------------------------------------------------------- preview
@@ -121,10 +121,10 @@ def _make_preview(src_path: str, enhanced: np.ndarray, out_path: str) -> None:
 
 # ---------------------------------------------------------------- per-page job
 def _one(job):
-    in_dir, app_dir, blank_dir, prev_dir, seq, f = job
-    src = os.path.join(in_dir, f)
+    src_dir, app_dir, blank_dir, prev_dir, seq, f, photo_dir = job
+    src = os.path.join(src_dir, f)
     t0 = time.time()
-    img, info = E.enhance_page(src)
+    img, info = E.enhance_page(src, photo_dir=photo_dir)
     info["seq"] = seq
 
     if img is None and info.get("status") == "blank":
@@ -154,40 +154,40 @@ def run(in_dir: str, out_root: str, workers: int | None = None,
     os.makedirs(blank_dir, exist_ok=True)
     os.makedirs(prev_dir, exist_ok=True)
 
-    all_tifs = sorted(f for f in os.listdir(in_dir) if f.lower().endswith(E.DOC_EXT))
-    jpgs     = sum(1 for f in os.listdir(in_dir) if f.lower().endswith(E.PHOTO_EXT))
-    if limit:
-        all_tifs = all_tifs[:limit]
-    if not all_tifs:
-        logging.error(f"No TIF pages found in {in_dir}")
+    # --- applications already grouped by scan.exe ---
+    apps = _read_app_folders(in_dir)
+    if not apps:
+        logging.error(f"No APP_xx folders found in {in_dir}. "
+                      f"Run scan.exe first and point --input at its output folder.")
         return
 
+    photo_dir = _raw_scan_dir(in_dir)
+    if photo_dir:
+        logging.info(f"Paired JPGs -> {photo_dir}")
+
+    total = sum(len(v) for v in apps.values())
     workers = workers or default_workers()
-    logging.info(f"{len(all_tifs)} TIF pages | {jpgs} JPGs (kept as-is) | {workers} workers")
+    logging.info(f"{len(apps)} applications | {total} TIF pages | {workers} workers")
     logging.info(f"  output  -> {out_root}")
     logging.info(f"  previews-> {prev_dir}")
 
-    # --- group by application via barcode separators ---
-    groups = _find_groups(in_dir, all_tifs, workers)
-
-    # build file -> app_dir mapping; separator pages have no APP folder
-    separators = set(all_tifs) - {f for g in groups for f in g}
-    app_dirs: dict[str, str] = {}
-    for gi, grp in enumerate(groups, 1):
-        app_dir = os.path.join(out_root, f"APP_{gi:02d}")
+    # --- build jobs, preserving the APP grouping ---
+    jobs = []
+    seq = 0
+    for app, tifs in apps.items():
+        app_dir = os.path.join(out_root, app)
         os.makedirs(app_dir, exist_ok=True)
-        for f in grp:
-            app_dirs[f] = app_dir
+        for f in tifs:
+            if limit and seq >= limit:
+                break
+            seq += 1
+            jobs.append((os.path.join(in_dir, app), app_dir, blank_dir,
+                         prev_dir, seq, f, photo_dir))
 
-    logging.info(f"APP folders created: {[f'APP_{i:02d}' for i in range(1, len(groups)+1)]}")
+    logging.info(f"APP folders: {list(apps)}")
 
     # --- enhance ---
     t0 = time.time()
-    jobs = [
-        (in_dir, app_dirs[f], blank_dir, prev_dir, i, f)
-        for i, f in enumerate(all_tifs, 1)
-        if f not in separators
-    ]
     results = []
     with ThreadPoolExecutor(max_workers=workers) as ex:
         for i, info in enumerate(ex.map(_one, jobs), 1):
@@ -203,13 +203,16 @@ def run(in_dir: str, out_root: str, workers: int | None = None,
     with open(os.path.join(out_root, "report.csv"), "w", newline="", encoding="utf-8") as fh:
         wr = csv.writer(fh)
         wr.writerow(["seq", "source_file", "app", "status", "output_file",
-                     "rotation_deg", "skew_deg", "holes_removed", "patches_removed",
+                     "gentle", "rotation_deg", "skew_deg", "holes_removed",
+                     "patches_removed", "outside_noise_removed",
                      "content_ink_pct", "in_KB", "out_KB", "ms"])
         for r in results:
             app_label = os.path.basename(r.get("app_dir", ""))
             wr.writerow([r.get("seq"), r.get("file"), app_label, r.get("status"),
-                         r.get("out", ""), r.get("rotation", ""), r.get("skew", ""),
+                         r.get("out", ""), r.get("gentle", ""),
+                         r.get("rotation", ""), r.get("skew", ""),
                          r.get("holes_removed", 0), r.get("patches_removed", 0),
+                         r.get("outside_noise_removed", 0),
                          round(r.get("content_ink_pct", 0), 2),
                          round(r.get("in_bytes", 0) / 1024),
                          round(r.get("bytes", 0) / 1024) if r.get("bytes") else "",
@@ -217,22 +220,28 @@ def run(in_dir: str, out_root: str, workers: int | None = None,
 
     with open(os.path.join(out_root, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump({
-            "input": in_dir, "output": out_root, "workers": workers,
-            "applications": len(groups), "separators": sorted(separators),
+            # "input" must be the RAW scan folder, not scan.exe's output: it is
+            # where the paired colour JPGs live, and index.exe reads this field
+            # to find the JPG it crops the applicant photo from.
+            "input": photo_dir or in_dir,
+            "scan_output": in_dir,
+            "output": out_root, "workers": workers,
+            "applications": len(apps),
             "seconds": round(el, 1),
-            "apps": [{"app": f"APP_{gi:02d}", "pages": len(g)}
-                     for gi, g in enumerate(groups, 1)],
+            "apps": [{"app": a, "pages": len(t)} for a, t in apps.items()],
             "pages": results,
         }, fh, indent=1)
 
-    ok    = [r for r in results if r.get("status") == "ok"]
-    blank = [r for r in results if r.get("status") == "blank"]
-    err   = [r for r in results if r.get("status") == "error"]
-    sizes = [r["bytes"] for r in ok if "bytes" in r]
+    ok     = [r for r in results if r.get("status") == "ok"]
+    blank  = [r for r in results if r.get("status") == "blank"]
+    err    = [r for r in results if r.get("status") == "error"]
+    sizes  = [r["bytes"] for r in ok if "bytes" in r]
+    gentle = sum(1 for r in ok if r.get("gentle"))
 
     logging.info("=" * 64)
-    logging.info(f"applications={len(groups)}  pages={len(results)}  "
+    logging.info(f"applications={len(apps)}  pages={len(results)}  "
                  f"enhanced={len(ok)}  blank={len(blank)}  errors={len(err)}")
+    logging.info(f"gentle(document pages)={gentle}  full(sparse pages)={len(ok)-gentle}")
     logging.info(f"time={el:.0f}s  {el/max(1,len(results))*1000:.0f} ms/page")
     if sizes:
         logging.info(f"output: Group4 TIFF  mean={sum(sizes)/len(sizes)/1024:.0f} KB  "
@@ -260,11 +269,13 @@ def _pick_folders_gui():
     root.withdraw()
     messagebox.showinfo(
         "LIC Document Enhancer",
-        "Step 1: Select the INPUT folder  (raw scanned TIF files)\n"
-        "Step 2: Select the OUTPUT folder (APP_01/, APP_02/... will be created here)\n\n"
+        "Step 1: Select the INPUT folder  (the OUTPUT folder from scan.exe,\n"
+        "        which already contains APP_01/, APP_02/... )\n"
+        "Step 2: Select the OUTPUT folder (enhanced APP_01/, APP_02/... go here)\n\n"
         "Previews (before vs after) are always written."
     )
-    in_dir = filedialog.askdirectory(title="Select INPUT folder (raw scanned TIF files)")
+    in_dir = filedialog.askdirectory(
+        title="Select INPUT folder (scan.exe output, containing APP_01/, APP_02/...)")
     if not in_dir:
         messagebox.showwarning("Cancelled", "No input folder selected. Exiting.")
         raise SystemExit(0)
@@ -280,9 +291,10 @@ def _pick_folders_gui():
 def main():
     ap = argparse.ArgumentParser(
         prog="enhance",
-        description="Enhance scanned LIC TIFs and group into APP_01/, APP_02/... folders")
-    ap.add_argument("--input",  help="folder containing raw scanned TIF files")
-    ap.add_argument("--output", help="output folder (APP_01/ etc. will be created here)")
+        description="Enhance the APP_xx folders produced by scan.exe")
+    ap.add_argument("--input",
+                    help="scan.exe output folder (contains APP_01/, APP_02/...)")
+    ap.add_argument("--output", help="output folder (enhanced APP_01/ etc. go here)")
     ap.add_argument("--workers", type=int, default=None)
     ap.add_argument("--limit",   type=int, default=None,
                     help="process only first N pages (quick test)")

@@ -13,6 +13,9 @@ Double-click: opens a single folder-picker dialog.
 """
 from __future__ import annotations
 
+import multiprocessing
+multiprocessing.freeze_support()   # must be before any other imports for frozen EXE
+
 import argparse
 import logging
 import os

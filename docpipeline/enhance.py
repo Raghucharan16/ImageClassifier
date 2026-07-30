@@ -24,12 +24,25 @@ actually contain the artefact):
                            injected-rotation tests at ~25ms, no OCR needed.
                            Runs BEFORE despeckling, which the classifier is
                            sensitive to.
-  7. despeckle           - isolated dust only; dot-matrix glyph dots are kept
-  8. fine deskew         - residual tilt, projection-profile search
+  7. outside-content     - dots and black lines in the white margin beyond the
+                           document's own bounding box (all pages)
+
+Then the pipeline FORKS on how densely the page is printed:
+
+  Gentle path - densely printed document pages (proposal forms, review slips,
+    enclosures, bank sheets). Content is left exactly as scanned; only a thin
+    edge trim is applied. Every filter below is skipped, because each one can
+    eat monospaced dot-matrix print: the streak remover once deleted 201 real
+    glyphs from a single review slip, since thin characters in monospaced text
+    line up into columns indistinguishable from a dashed roller streak.
+
+  Full path - sparse pages (photocopied ID cards): little content, plenty of
+    scanner noise, and they need the aggressive work.
+  8. margin lines        - thin horizontal streaks in top/bottom 12% of page
+  9. despeckle           - isolated dots and thin dashes (scanner dust)
+ 10. fine deskew         - residual tilt, projection-profile search
                            (0.034 deg mean error, hierarchical for speed)
-  9. halftone smoothing  - dithered ID-card photocopies are downsampled and
-                           smoothed so they are readable and compress sanely
- 10. crop + Group4 save
+ 11. crop + Group4 save
 
 No OCR and no heavy filters, so a page stays far inside the 1s/page budget.
 """
@@ -282,6 +295,146 @@ def clean_artefacts(gray: np.ndarray,
     return out, info
 
 
+# ------------------------------------------- noise outside the content region
+def content_bbox(gray: np.ndarray, frac: float = 0.010,
+                 pad_frac: float = 0.015):
+    """Bounding box of the page's real content, ignoring stray noise.
+
+    A row belonging to the document carries ink across a meaningful part of the
+    width, while a row holding only scanner dirt carries a handful of pixels.
+    Requiring `frac` of the dimension (1%, i.e. ~17 px on a 1700 px-wide page)
+    therefore brackets the text block and excludes speckled margins -- the
+    largest confirmed noise dot is ~10 px across, so a row of them cannot reach
+    the threshold. Deliberately stricter than crop_to_content's 0.2%, whose job
+    is to keep everything, whereas this box is used to decide what is OUTSIDE
+    the document and safe to erase.
+
+    Returns (x0, y0, x1, y1) padded outward by pad_frac, or None when the page
+    has no discernible content.
+    """
+    h, w = gray.shape[:2]
+    ink = gray < 128
+    rows = np.where(ink.sum(axis=1) > frac * w)[0]
+    cols = np.where(ink.sum(axis=0) > frac * h)[0]
+    if rows.size == 0 or cols.size == 0:
+        return None
+    py, px = int(h * pad_frac), int(w * pad_frac)
+    return (max(0, int(cols[0]) - px), max(0, int(rows[0]) - py),
+            min(w, int(cols[-1]) + px + 1), min(h, int(rows[-1]) + py + 1))
+
+
+def remove_outside_content(gray: np.ndarray, dot_area: int = 400,
+                           thin_px: int = 16, keep_area: int = 12000
+                           ) -> tuple[np.ndarray, int]:
+    """Erase dots and black lines lying in the white margin outside the content.
+
+    Anything wholly outside the content box is, by construction, not part of the
+    document -- so this pass can be far more aggressive than despeckle(), which
+    has to work amid text and is therefore limited to isolated specks of <=80 px.
+    Out here the two artefacts the scanner leaves are handled directly:
+
+      * dots / blobs  - up to `dot_area` px (5x despeckle's limit), since there
+        is no neighbouring text to confuse them with.
+      * black lines   - any component thinner than `thin_px` in one dimension,
+        at any length. Length has to be unbounded because the streaks and edge
+        bars that survive into the margin run for hundreds of pixels; thinness
+        is what marks them as a line rather than an object.
+
+    `keep_area` protects a genuinely large, solid object that happens to sit in
+    the margin (a photo or stamp overhanging the text block): a chunky mass that
+    big is content, not dirt, so it is left alone even out here.
+
+    Components straddling the boundary are never touched -- only those entirely
+    outside it -- so a descender or table rule reaching into the margin is safe.
+    """
+    box = content_bbox(gray)
+    if box is None:
+        return gray, 0
+    x0, y0, x1, y1 = box
+
+    ink = _ink(gray)
+    n, lab, stats, _cents = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if n <= 1:
+        return gray, 0
+
+    xs = stats[:, cv2.CC_STAT_LEFT]
+    ys = stats[:, cv2.CC_STAT_TOP]
+    ws = stats[:, cv2.CC_STAT_WIDTH]
+    hs = stats[:, cv2.CC_STAT_HEIGHT]
+    areas = stats[:, cv2.CC_STAT_AREA]
+
+    # entirely outside the content box
+    outside = ((xs + ws <= x0) | (xs >= x1) | (ys + hs <= y0) | (ys >= y1))
+    is_dot = areas <= dot_area
+    is_line = np.minimum(ws, hs) <= thin_px
+    chunky = (areas > keep_area) & (np.minimum(ws, hs) > thin_px)
+
+    kill = np.where(outside & (is_dot | is_line) & ~chunky)[0]
+    kill = kill[kill != 0]
+    if not kill.size:
+        return gray, 0
+    return _erase(gray, lab, kill.tolist(), n), int(kill.size)
+
+
+# ------------------------------------------------- page type (gentle vs full)
+def component_density(gray: np.ndarray, min_area: int = 15,
+                      min_h: int = 6) -> float:
+    """Real ink components per megapixel -- how densely printed the page is."""
+    h, w = gray.shape[:2]
+    mp = (h * w) / 1e6
+    if mp <= 0:
+        return 0.0
+    n, _lab, stats, _c = cv2.connectedComponentsWithStats(_ink(gray), connectivity=8)
+    if n <= 1:
+        return 0.0
+    areas = stats[:, cv2.CC_STAT_AREA]
+    hs = stats[:, cv2.CC_STAT_HEIGHT]
+    real = np.where((areas >= min_area) & (hs >= min_h))[0]
+    real = real[real != 0]
+    return float(real.size) / mp
+
+
+# Measured on a labelled sample of the real batches (components per megapixel):
+#     proposal forms   474 - 873
+#     review slips     536 - 559
+#     enclosures       441 - 537
+#     bank sheets      583 - 644
+#     LIC policy slip  421
+#     ID card scans    136 - 146
+# Printed document pages cluster far above the ID cards, with an empty gap from
+# 146 to 421, so this threshold sits in the middle of that gap.
+DOC_DENSITY = 280.0
+
+
+def is_document_page(gray: np.ndarray) -> bool:
+    """True for a densely printed document page (form, review slip, enclosure).
+
+    These pages get the GENTLE treatment: their content is the whole point of
+    the scan and every aggressive filter risks eating it -- the streak remover
+    once deleted 201 real glyphs from a single review slip, because dot-matrix
+    print is monospaced and its thin characters line up into columns that look
+    exactly like a dashed roller streak. Sparse pages (photocopied ID cards) are
+    the opposite case: little content, lots of scanner noise, and they genuinely
+    need the full clean-up plus the rebuild-from-JPG path.
+    """
+    return component_density(gray) >= DOC_DENSITY
+
+
+def trim_edges(gray: np.ndarray, frac: float = 0.01) -> np.ndarray:
+    """Shave a thin border off the page.
+
+    The gentle alternative to crop_to_content: it removes the scanner's edge
+    darkening without moving the content or changing the page proportions, which
+    matters because crop_to_content reflows the page and downstream steps read
+    the aspect ratio to identify the wide LIC policy slip.
+    """
+    h, w = gray.shape[:2]
+    dy, dx = int(h * frac), int(w * frac)
+    if h - 2 * dy < 20 or w - 2 * dx < 20:
+        return gray
+    return gray[dy:h - dy, dx:w - dx]
+
+
 # ---------------------------------------------------------- scanner streaks
 def remove_streaks(gray: np.ndarray, max_width: int = 14, max_h_frac: float = 0.15,
                    x_tol: float = 6.0, min_span: float = 0.10, min_blobs: int = 4,
@@ -357,35 +510,89 @@ def remove_streaks(gray: np.ndarray, max_width: int = 14, max_h_frac: float = 0.
     return _erase(gray, lab, sorted(kill), n), len(kill)
 
 
-# --------------------------------------------------------------- despeckle
-def despeckle(gray: np.ndarray, max_area: int = 12, max_wh: int = 7,
-              win: int = 25, min_neighbour: float = 0.020) -> np.ndarray:
-    """Remove small black dots that are *isolated* (scanner dust) while keeping
-    text.
+# -------------------------------------------- remove horizontal margin lines
+def remove_margin_lines(gray: np.ndarray,
+                        margin_frac: float = 0.12,
+                        min_span: float = 0.35,
+                        max_height: int = 6) -> tuple[np.ndarray, int]:
+    """Remove thin horizontal lines in the top/bottom margins from scanner feed.
 
-    Size alone is unsafe here: this batch is largely dot-matrix print whose
-    glyphs are built from separate small dots, so a size-only filter erodes real
-    characters (it removed ~4% of a page's ink and even flipped the orientation
-    result). A speck is deleted only when its neighbourhood is nearly empty --
-    dust sits alone, a glyph dot always has companions.
+    These appear as 1–5 px tall horizontal streaks spanning 35–100% of the
+    page width, located only in the first/last 12% of the page height. Real
+    content (ruled lines, boxes) is located in the central 76% of the page,
+    so restricting to the outer margins makes this very safe.
+    """
+    h, w = gray.shape[:2]
+    margin_rows = int(h * margin_frac)
+    ink = _ink(gray)
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if n <= 1:
+        return gray, 0
+
+    tops    = stats[:, cv2.CC_STAT_TOP]
+    heights = stats[:, cv2.CC_STAT_HEIGHT]
+    widths  = stats[:, cv2.CC_STAT_WIDTH]
+
+    in_margin = (
+        ((tops < margin_rows) | (tops + heights > h - margin_rows))
+        & (heights <= max_height)
+        & (widths >= min_span * w)
+    )
+    in_margin[0] = False
+    kill = np.where(in_margin)[0].tolist()
+    if not kill:
+        return gray, 0
+    return _erase(gray, lab, kill, n), len(kill)
+
+
+# --------------------------------------------------------------- despeckle
+def despeckle(gray: np.ndarray, win: int = 50,
+              min_neighbour: float = 0.020) -> np.ndarray:
+    """Remove isolated scanner dust while keeping all text and handwriting.
+
+    Two candidate shapes are targeted (measured on real scans):
+      • Dots / blobs  : max(w, h) <= 12, area <= 80
+      • Thin dashes   : min(w, h) <= 3, max(w, h) <= 45, area <= 120
+        (short streaks from the scanner transport mechanism)
+
+    A candidate is only erased when its neighbourhood (win × win window) has
+    fewer than min_neighbour × win² ink pixels excluding itself.  That means
+    a speck surrounded by empty paper is erased; a dot that is part of text
+    or a signature is left alone (it always has companion ink nearby).
+
+    Thresholds calibrated on this batch:
+      - Smallest real glyph stroke:  3 × 14 px, area 40  → nearby ink ~150
+      - Largest confirmed noise dot:  7 × 10 px, area  39 → nearby ink   0
+      - Largest confirmed noise dash: 5 × 13 px, area  52 → nearby ink  18
+      - Safe nearby-ink threshold:   min_neighbour × win² = 0.020 × 2500 = 50
     """
     ink = _ink(gray)
     n, lab, stats, cents = cv2.connectedComponentsWithStats(ink, connectivity=8)
     if n <= 1:
         return gray
+
     areas = stats[:, cv2.CC_STAT_AREA]
-    small = ((areas <= max_area)
-             & (stats[:, cv2.CC_STAT_WIDTH] <= max_wh)
-             & (stats[:, cv2.CC_STAT_HEIGHT] <= max_wh))
-    small[0] = False
-    sel = np.where(small)[0]
+    Ws    = stats[:, cv2.CC_STAT_WIDTH]
+    Hs    = stats[:, cv2.CC_STAT_HEIGHT]
+    maxWH = np.maximum(Ws, Hs)
+    minWH = np.minimum(Ws, Hs)
+
+    is_dot  = (areas <= 80)  & (maxWH <= 12)
+    is_dash = (areas <= 120) & (minWH <= 3) & (maxWH <= 45)
+    cand = is_dot | is_dash
+    cand[0] = False   # never touch background label
+
+    sel = np.where(cand)[0]
     if sel.size == 0:
         return gray
-    dens = cv2.boxFilter((ink > 0).astype(np.float32), -1, (win, win), normalize=True)
+
+    dens = cv2.boxFilter((ink > 0).astype(np.float32), -1, (win, win),
+                         normalize=True)
     cy = np.clip(cents[sel, 1].astype(int), 0, gray.shape[0] - 1)
     cx = np.clip(cents[sel, 0].astype(int), 0, gray.shape[1] - 1)
     nearby = dens[cy, cx] * (win * win) - areas[sel]
-    return _erase(gray, lab, sel[nearby <= min_neighbour * win * win].tolist(), n)
+    kill = sel[nearby < min_neighbour * win * win].tolist()
+    return _erase(gray, lab, kill, n)
 
 
 # ------------------------------------------------------------------ deskew
@@ -445,21 +652,29 @@ def rotate_keep_page(gray: np.ndarray, angle: float) -> np.ndarray:
 
 
 # -------------------------------------- dark ID-card pages: rebuild from JPG
-def paired_photo_path(doc_path: str) -> str | None:
+def paired_photo_path(doc_path: str, photo_dir: str | None = None) -> str | None:
     """The colour JPG of the same physical page.
 
     The dual-stream scanner writes the JPG first, so TIF `000000NN` pairs with
     JPG `000000NN-1` (verified across the sample batches).
+
+    photo_dir: where to look for the JPG. Needed because scan.exe copies only
+    TIFs into its APP_xx folders, leaving the JPGs behind in the original scan
+    folder -- so once enhancement reads from scan.exe's output, the JPG is no
+    longer beside its TIF. Defaults to the TIF's own directory.
     """
     d, name = os.path.split(doc_path)
     stem, _ = os.path.splitext(name)
     if not stem.isdigit():
         return None
     cand = f"{int(stem) - 1:0{len(stem)}d}"
-    for ext in PHOTO_EXT:
-        p = os.path.join(d, cand + ext)
-        if os.path.exists(p):
-            return p
+    for base in (photo_dir, d):
+        if not base:
+            continue
+        for ext in PHOTO_EXT:
+            p = os.path.join(base, cand + ext)
+            if os.path.exists(p):
+                return p
     return None
 
 
@@ -501,8 +716,13 @@ def crop_to_content(gray: np.ndarray, pad: int = 20,
 
 # ---------------------------------------------------------------- pipeline
 def enhance_page(path: str, blank_ink_pct: float = 0.35,
-                 dark_pct: float = 25.0) -> tuple[np.ndarray | None, dict]:
-    """Full clean-up for one scanned page. Returns (image or None, info)."""
+                 dark_pct: float = 25.0,
+                 photo_dir: str | None = None) -> tuple[np.ndarray | None, dict]:
+    """Full clean-up for one scanned page. Returns (image or None, info).
+
+    photo_dir: folder holding the paired colour JPGs (the original scan folder),
+    used to rebuild dark ID-card photocopies. See paired_photo_path.
+    """
     info: dict = {"file": os.path.basename(path)}
     gray = load_bitonal(path)
     if gray is None:
@@ -517,7 +737,7 @@ def enhance_page(path: str, blank_ink_pct: float = 0.35,
     # bitonal threshold failed (typically a dark ID-card photocopy). Rebuild it
     # from the colour JPG of the same page, which still has real grey levels.
     if cinfo.get("content_ink_pct", 0.0) >= dark_pct:
-        jpg = paired_photo_path(path)
+        jpg = paired_photo_path(path, photo_dir)
         rebuilt = rebuild_from_photo(jpg) if jpg else None
         if rebuilt is not None:
             g, cinfo = clean_artefacts(rebuilt)
@@ -534,8 +754,28 @@ def enhance_page(path: str, blank_ink_pct: float = 0.35,
     rot = detect_page_rotation(g)          # before despeckle: classifier is
     info["rotation"] = rot                 # sensitive to fine dot structure
     g = apply_rotation(g, rot)
+
+    # Dots and black lines in the white margin are unambiguously scanner dirt,
+    # so this runs on EVERY page, gentle or not.
+    g, outside = remove_outside_content(g)
+    info["outside_noise_removed"] = outside
+
+    # Densely printed pages (forms, review slips) keep their content untouched:
+    # feed holes and scanner bars are already gone via clean_artefacts above, and
+    # all that remains is to shave the edge. The filters skipped here all carry a
+    # risk of eating monospaced dot-matrix print.
+    gentle = is_document_page(g)
+    info["gentle"] = gentle
+    if gentle:
+        g = trim_edges(g)
+        info["status"] = "ok"
+        info["out_shape"] = g.shape
+        return g, info
+
     g, streak = remove_streaks(g)
     info["streak_blobs_removed"] = streak
+    g, margin_lines = remove_margin_lines(g)
+    info["margin_lines_removed"] = margin_lines
     g = despeckle(g)
 
     angle = find_skew(g)

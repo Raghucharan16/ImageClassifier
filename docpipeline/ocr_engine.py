@@ -26,6 +26,37 @@ from paths import resource_path
 logging.getLogger("RapidOCR").setLevel(logging.WARNING)
 
 
+_cuda_available: bool | None = None
+
+
+def cuda_available() -> bool:
+    """True when onnxruntime on THIS machine can actually run on CUDA.
+
+    Asks onnxruntime what providers it was built with rather than looking for a
+    GPU directly: a CUDA-capable card is useless if the installed wheel is the
+    CPU-only or DirectML one, and that mismatch is the normal state of affairs
+    (the three onnxruntime variants cannot be installed side by side). Probing
+    the runtime therefore answers the only question that matters -- will
+    use_cuda=True actually work here -- and lets one build serve both GPU and
+    CPU machines. Run setup_runtime.py once per machine to install the matching
+    wheel; see RAPIDOCR_CUDA to override.
+    """
+    global _cuda_available
+    if _cuda_available is None:
+        override = os.environ.get("RAPIDOCR_CUDA")
+        if override is not None:
+            _cuda_available = override == "1"
+        else:
+            try:
+                import onnxruntime as ort
+                _cuda_available = "CUDAExecutionProvider" in ort.get_available_providers()
+            except Exception:
+                _cuda_available = False
+        logging.info("OCR execution provider: %s",
+                     "CUDA (GPU)" if _cuda_available else "CPU")
+    return _cuda_available
+
+
 def _load_bgr(img_path: str):
     """Load any image (jpg/tif/png) as a BGR ndarray, robust to odd TIFFs."""
     img = cv2.imread(img_path)
@@ -70,16 +101,34 @@ class RapidOCREngine:
     """
 
     def __init__(self, sparse_char_threshold: int = 40, low_conf: float = 0.55,
-                 enable_tamil: bool = False, intra_threads: int | None = None):
+                 enable_tamil: bool = False, intra_threads: int | None = None,
+                 use_cuda: bool | None = None):
         # Bundled ch+en PP-OCRv4 models. The detector is language-agnostic;
         # the recognizer handles Latin/English well. intra_threads caps the
         # onnxruntime thread pool -- set it low when running many parallel
         # worker processes so they don't oversubscribe the CPU.
-        self.engine = RapidOCR(intra_op_num_threads=intra_threads) if intra_threads \
-            else RapidOCR()
+        #
+        # use_cuda defaults to None = auto-detect: GPU when the installed
+        # onnxruntime actually offers the CUDA provider, CPU otherwise. One
+        # build therefore runs correctly on both a 4090 workstation and a
+        # CPU-only client machine with no flags to remember. rec_batch_num is
+        # raised to 32 on GPU so more crops go per ONNX call, amortising CUDA
+        # kernel-launch overhead.
+        if use_cuda is None:
+            use_cuda = cuda_available()
+        cuda_kwargs: dict = (
+            {"det_use_cuda": True, "rec_use_cuda": True, "cls_use_cuda": True,
+             "rec_batch_num": 32}
+            if use_cuda else {}
+        )
+        base_kwargs: dict = (
+            {"intra_op_num_threads": intra_threads} if intra_threads else {}
+        )
+        self.engine = RapidOCR(**base_kwargs, **cuda_kwargs)
         self.sparse_char_threshold = sparse_char_threshold
         self.low_conf = low_conf
-        logging.info("RapidOCR (ONNX) engine initialized.")
+        logging.info("RapidOCR (ONNX) engine initialized%s.",
+                     " [CUDA]" if use_cuda else "")
 
         self.tamil = None
         if enable_tamil:

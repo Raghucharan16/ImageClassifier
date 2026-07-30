@@ -1,0 +1,15 @@
+# CPU-only machines (client deployments). Install with:
+#
+#     pip install -r requirements-cpu.txt
+#
+# If a GPU build is already present, uninstall it FIRST -- these distributions
+# share file paths and overwrite each other:
+#
+#     pip uninstall -y onnxruntime-gpu onnxruntime-directml
+#
+# `python setup_runtime.py` does that sequence for you, including repairing an
+# install already broken by a previous swap.
+
+-r requirements.txt
+
+onnxruntime>=1.17            # CPU execution provider

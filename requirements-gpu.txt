@@ -1,0 +1,28 @@
+# NVIDIA GPU machines (e.g. RTX 4090). Install with:
+#
+#     pip install -r requirements-gpu.txt
+#
+# Requires an NVIDIA driver providing CUDA 12.x (driver >= 527). The CUDA and
+# cuDNN libraries come in with the wheel, so no separate toolkit install is
+# needed.
+#
+# If the CPU or DirectML build is already present, uninstall it FIRST -- these
+# distributions share file paths and overwrite each other:
+#
+#     pip uninstall -y onnxruntime onnxruntime-directml
+#
+# `python setup_runtime.py` does that sequence for you, including repairing an
+# install already broken by a previous swap.
+#
+# The pipeline needs no flag to use the GPU: it detects the CUDA provider at
+# startup, raises the OCR batch size, and drops to 4 worker processes (one GPU is
+# the shared bottleneck, so more processes only queue against it while each
+# duplicates the models in VRAM).
+
+-r requirements.txt
+
+onnxruntime-gpu>=1.17        # CUDA execution provider
+
+# Note: DirectML (onnxruntime-directml) is intentionally not offered. Measured on
+# this project's models against an Intel Arc integrated GPU it gave 8.47 s/page
+# versus 8.57 s on CPU -- no gain for an extra moving part.
