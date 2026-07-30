@@ -203,16 +203,20 @@ def run(in_dir: str, out_root: str, workers: int | None = None,
     with open(os.path.join(out_root, "report.csv"), "w", newline="", encoding="utf-8") as fh:
         wr = csv.writer(fh)
         wr.writerow(["seq", "source_file", "app", "status", "output_file",
-                     "gentle", "rotation_deg", "skew_deg", "holes_removed",
+                     "rotation_deg", "skew_deg", "holes_removed", "hole_crop",
                      "patches_removed", "outside_noise_removed",
+                     "streaks_removed", "margin_lines_removed",
                      "content_ink_pct", "in_KB", "out_KB", "ms"])
         for r in results:
             app_label = os.path.basename(r.get("app_dir", ""))
             wr.writerow([r.get("seq"), r.get("file"), app_label, r.get("status"),
-                         r.get("out", ""), r.get("gentle", ""),
+                         r.get("out", ""),
                          r.get("rotation", ""), r.get("skew", ""),
-                         r.get("holes_removed", 0), r.get("patches_removed", 0),
+                         r.get("holes_removed", 0), r.get("hole_crop", ""),
+                         r.get("patches_removed", 0),
                          r.get("outside_noise_removed", 0),
+                         r.get("streak_blobs_removed", 0),
+                         r.get("margin_lines_removed", 0),
                          round(r.get("content_ink_pct", 0), 2),
                          round(r.get("in_bytes", 0) / 1024),
                          round(r.get("bytes", 0) / 1024) if r.get("bytes") else "",
@@ -236,12 +240,16 @@ def run(in_dir: str, out_root: str, workers: int | None = None,
     blank  = [r for r in results if r.get("status") == "blank"]
     err    = [r for r in results if r.get("status") == "error"]
     sizes  = [r["bytes"] for r in ok if "bytes" in r]
-    gentle = sum(1 for r in ok if r.get("gentle"))
+    cropped = sum(1 for r in ok if r.get("hole_crop"))
+    streaks = sum(r.get("streak_blobs_removed", 0) for r in ok)
+    dots    = sum(r.get("outside_noise_removed", 0) for r in ok)
 
     logging.info("=" * 64)
     logging.info(f"applications={len(apps)}  pages={len(results)}  "
                  f"enhanced={len(ok)}  blank={len(blank)}  errors={len(err)}")
-    logging.info(f"gentle(document pages)={gentle}  full(sparse pages)={len(ok)-gentle}")
+    logging.info(f"streak fragments removed={streaks}  margin dots/lines removed={dots}")
+    logging.info(f"punch-hole crop applied to {cropped}/{len(ok)} pages "
+                 f"(others keep scanned size)")
     logging.info(f"time={el:.0f}s  {el/max(1,len(results))*1000:.0f} ms/page")
     if sizes:
         logging.info(f"output: Group4 TIFF  mean={sum(sizes)/len(sizes)/1024:.0f} KB  "

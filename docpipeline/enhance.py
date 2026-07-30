@@ -25,24 +25,23 @@ actually contain the artefact):
                            Runs BEFORE despeckling, which the classifier is
                            sensitive to.
   7. outside-content     - dots and black lines in the white margin beyond the
-                           document's own bounding box (all pages)
+                           document's own bounding box
+  8. roller streaks      - the dashed vertical lines a dirty roller leaves
+  9. margin lines        - thin horizontal streaks in top/bottom 12% of page
+ 10. despeckle           - isolated dots and thin dashes (scanner dust)
+ 11. fine deskew         - residual tilt, projection-profile search
+                           (0.034 deg mean error, hierarchical for speed); pads
+                           with white, so it never cuts content
+ 12. punch-hole crop     - trims ONLY the left/right strips that held tractor-feed
+                           holes, and only when such a column was detected. This
+                           is the pipeline's only crop: a page with clean margins
+                           keeps its scanned dimensions.
+ 13. Group4 save
 
-Then the pipeline FORKS on how densely the page is printed:
-
-  Gentle path - densely printed document pages (proposal forms, review slips,
-    enclosures, bank sheets). Content is left exactly as scanned; only a thin
-    edge trim is applied. Every filter below is skipped, because each one can
-    eat monospaced dot-matrix print: the streak remover once deleted 201 real
-    glyphs from a single review slip, since thin characters in monospaced text
-    line up into columns indistinguishable from a dashed roller streak.
-
-  Full path - sparse pages (photocopied ID cards): little content, plenty of
-    scanner noise, and they need the aggressive work.
-  8. margin lines        - thin horizontal streaks in top/bottom 12% of page
-  9. despeckle           - isolated dots and thin dashes (scanner dust)
- 10. fine deskew         - residual tilt, projection-profile search
-                           (0.034 deg mean error, hierarchical for speed)
- 11. crop + Group4 save
+Every noise filter runs on every page. Nothing here is skipped by page type:
+these artefacts are all scanner output, never document content. The streak
+remover is safe even on monospaced dot-matrix print thanks to its
+alone_on_its_rows test -- see remove_streaks.
 
 No OCR and no heavy filters, so a page stays far inside the 1s/page budget.
 """
@@ -256,6 +255,14 @@ def clean_artefacts(gray: np.ndarray,
             continue                                # irregular -> text, not holes
         kill.update(sel.tolist())
         info["holes_removed"] += int(sel.size)
+        # Record where the punched column sits. This is the ONLY thing that
+        # licenses a crop later (see crop_hole_bands): pages without punch holes
+        # are left at their scanned size.
+        info.setdefault("hole_bands", []).append({
+            "side": "left" if lo == 0 else "right",
+            "x0": int(xs[sel].min()),
+            "x1": int((xs[sel] + ws[sel]).max()),
+        })
 
     # ---- solid masses: scanner background (border-touching) and dark patches
     kb = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
@@ -420,19 +427,39 @@ def is_document_page(gray: np.ndarray) -> bool:
     return component_density(gray) >= DOC_DENSITY
 
 
-def trim_edges(gray: np.ndarray, frac: float = 0.01) -> np.ndarray:
-    """Shave a thin border off the page.
+def crop_hole_bands(gray: np.ndarray, bands, pad: int = 6,
+                    max_frac: float = 0.14) -> tuple[np.ndarray, bool]:
+    """Trim off the left/right strips that held tractor-feed punch holes.
 
-    The gentle alternative to crop_to_content: it removes the scanner's edge
-    darkening without moving the content or changing the page proportions, which
-    matters because crop_to_content reflows the page and downstream steps read
-    the aspect ratio to identify the wide LIC policy slip.
+    This is the ONLY cropping the pipeline does. Pages with no punched column
+    come back untouched at their scanned size -- earlier versions ran
+    crop-to-content on everything, which reflowed pages that had nothing wrong
+    with their margins.
+
+    The punch holes themselves are already erased by clean_artefacts; what is
+    left is an empty strip down the edge, and this removes it. Only the strip is
+    taken: the cut lands just inside the hole column (pad px past it), never into
+    the text block. `max_frac` caps each side at 14% of the width so a bad hole
+    detection cannot eat a real margin -- a genuine punched column sits within a
+    few percent of the edge.
+
+    Returns (image, cropped?).
     """
+    if not bands:
+        return gray, False
     h, w = gray.shape[:2]
-    dy, dx = int(h * frac), int(w * frac)
-    if h - 2 * dy < 20 or w - 2 * dx < 20:
-        return gray
-    return gray[dy:h - dy, dx:w - dx]
+    x0, x1 = 0, w
+    limit = int(w * max_frac)
+    for b in bands:
+        if b["side"] == "left":
+            cut = min(int(b["x1"]) + pad, limit)
+            x0 = max(x0, cut)
+        else:
+            cut = max(int(b["x0"]) - pad, w - limit)
+            x1 = min(x1, cut)
+    if x1 - x0 < 0.5 * w:      # refuse an implausible cut
+        return gray, False
+    return gray[:, x0:x1], True
 
 
 # ---------------------------------------------------------- scanner streaks
@@ -755,33 +782,32 @@ def enhance_page(path: str, blank_ink_pct: float = 0.35,
     info["rotation"] = rot                 # sensitive to fine dot structure
     g = apply_rotation(g, rot)
 
-    # Dots and black lines in the white margin are unambiguously scanner dirt,
-    # so this runs on EVERY page, gentle or not.
+    # --- noise removal: runs on EVERY page ---------------------------------
+    # These are the black dots and black lines the scanner adds, and none of them
+    # is ever content, so no page is exempt. remove_streaks is safe even on
+    # monospaced dot-matrix print because of its alone_on_its_rows test: streak
+    # fragments sit on otherwise-empty rows (measured 0.0000) while the thinnest
+    # real glyph still shares its rows with the rest of its text line (0.0005).
     g, outside = remove_outside_content(g)
     info["outside_noise_removed"] = outside
-
-    # Densely printed pages (forms, review slips) keep their content untouched:
-    # feed holes and scanner bars are already gone via clean_artefacts above, and
-    # all that remains is to shave the edge. The filters skipped here all carry a
-    # risk of eating monospaced dot-matrix print.
-    gentle = is_document_page(g)
-    info["gentle"] = gentle
-    if gentle:
-        g = trim_edges(g)
-        info["status"] = "ok"
-        info["out_shape"] = g.shape
-        return g, info
-
     g, streak = remove_streaks(g)
     info["streak_blobs_removed"] = streak
     g, margin_lines = remove_margin_lines(g)
     info["margin_lines_removed"] = margin_lines
     g = despeckle(g)
 
+    # --- straighten -------------------------------------------------------
+    # Deskew pads with white rather than cutting, so it costs no content.
     angle = find_skew(g)
     info["skew"] = round(angle, 2)
     g = rotate_keep_page(g, angle)
-    g = crop_to_content(g)
+
+    # --- crop: punch-hole strips ONLY -------------------------------------
+    # Nothing else is cropped. A page with no punched column keeps its scanned
+    # dimensions.
+    g, cropped = crop_hole_bands(g, cinfo.get("hole_bands"))
+    info["hole_crop"] = cropped
+
     info["status"] = "ok"
     info["out_shape"] = g.shape
     return g, info

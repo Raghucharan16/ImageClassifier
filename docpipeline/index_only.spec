@@ -7,26 +7,25 @@ from pathlib import Path
 
 VENV = Path(r"C:\Users\venka\OneDrive\Desktop\ImageClassifier\.venv")
 PIPE = Path(r"C:\Users\venka\OneDrive\Desktop\ImageClassifier\docpipeline")
-OFF  = Path(r"C:\Users\venka\OneDrive\Desktop\ImageClassifier\offlineImageClassification")
 
 datas = [
     # rapidocr models (shipped inside its wheel)
     (str(VENV / "Lib/site-packages/rapidocr_onnxruntime"), "rapidocr_onnxruntime"),
     # signature ONNX model
-    (str(OFF / "models/signature/signature.onnx"), "models/signature"),
-    # offlineImageClassification source modules (ocr_engine, rules, signature_detector)
-    (str(OFF / "ocr_engine.py"),          "."),
-    (str(OFF / "rules.py"),               "."),
-    (str(OFF / "signature_detector.py"),  "."),
-    # zxing-cpp native lib (barcode reading)
-    (str(VENV / "Lib/site-packages/zxingcpp"), "zxingcpp"),
+    (str(PIPE / "models/signature/signature.onnx"), "models/signature"),
+    # shared modules (moved here from offlineImageClassification)
+    (str(PIPE / "ocr_engine.py"),         "."),
+    (str(PIPE / "rules.py"),              "."),
+    (str(PIPE / "signature_detector.py"), "."),
+    (str(PIPE / "paths.py"),              "."),
+    (str(PIPE / "appnumber.py"),          "."),
 ]
 
 block_cipher = None
 
 a = Analysis(
     [str(PIPE / "index_runner.py")],
-    pathex=[str(PIPE), str(OFF)],
+    pathex=[str(PIPE)],
     binaries=[],
     datas=datas,
     hiddenimports=[
@@ -35,10 +34,10 @@ a = Analysis(
         "rapidocr_onnxruntime",
         "PIL",
         "PIL.Image",
-        "PIL.TiffImagePlugin",
+        "PIL.TiffImagePlugin",   # AppendingTiffWriter: photo page + Group4 pages
         "cv2",
         "numpy",
-        "zxingcpp",
+        "appnumber",
         "tkinter",
         "tkinter.filedialog",
         "tkinter.messagebox",
