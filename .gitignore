@@ -19,6 +19,12 @@ docpipeline/dist/
 *.bin
 *.safetensors
 
+# ...but the signature detector IS a project asset: unlike the RapidOCR and
+# rapid-orientation models, which arrive with their pip wheels, this one cannot
+# be reinstalled and index.exe will not build without it. 36 MB, so it fits in
+# git directly (GitHub's hard limit is 100 MB) with no LFS needed.
+!docpipeline/models/signature/signature.onnx
+
 # Compiled EXE (too large for git)
 *.exe
 
