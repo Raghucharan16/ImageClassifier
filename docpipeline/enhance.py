@@ -330,37 +330,93 @@ def content_bbox(gray: np.ndarray, frac: float = 0.010,
             min(w, int(cols[-1]) + px + 1), min(h, int(rows[-1]) + py + 1))
 
 
-def remove_outside_content(gray: np.ndarray, dot_area: int = 400,
-                           thin_px: int = 16, keep_area: int = 12000
-                           ) -> tuple[np.ndarray, int]:
-    """Erase dots and black lines lying in the white margin outside the content.
+def _word_mask(ink: np.ndarray, stats: np.ndarray, cents: np.ndarray, n: int,
+               gap: int = 14, min_w: int = 32, max_h: int = 70) -> np.ndarray:
+    """Per-component flag: does this component sit inside a word?
 
-    Anything wholly outside the content box is, by construction, not part of the
-    document -- so this pass can be far more aggressive than despeckle(), which
-    has to work amid text and is therefore limited to isolated specks of <=80 px.
-    Out here the two artefacts the scanner leaves are handled directly:
+    The guard that makes row-based cleaning safe for SHORT text. Judging by rows
+    alone works for a full line of print but not for a lone word: "Place",
+    "Date" and a handwritten agent name each occupy a row that carries almost no
+    other ink, so the row test read them as dirt and erased them.
 
-      * dots / blobs  - up to `dot_area` px (5x despeckle's limit), since there
-        is no neighbouring text to confuse them with.
-      * black lines   - any component thinner than `thin_px` in one dimension,
-        at any length. Length has to be unbounded because the streaks and edge
-        bars that survive into the margin run for hundreds of pixels; thinness
-        is what marks them as a line rather than an object.
-
-    `keep_area` protects a genuinely large, solid object that happens to sit in
-    the margin (a photo or stamp overhanging the text block): a chunky mass that
-    big is content, not dirt, so it is left alone even out here.
-
-    Components straddling the boundary are never touched -- only those entirely
-    outside it -- so a descender or table rule reaching into the margin is safe.
+    What still separates them from dirt is company. Letters stand shoulder to
+    shoulder with gaps of only a few pixels, so closing horizontally with a
+    `gap`-wide kernel fuses a word into a single run at least `min_w` wide and no
+    more than `max_h` tall. Scanner artefacts have no such company: a streak's
+    dashes are stacked vertically so nothing fuses sideways, and scattered specks
+    lie far further apart than a letter gap.
     """
-    box = content_bbox(gray)
-    if box is None:
-        return gray, 0
-    x0, y0, x1, y1 = box
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (gap, 1))
+    runs = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k)
+    rn, rlab, rstats, _rc = cv2.connectedComponentsWithStats(runs, connectivity=8)
+    if rn <= 1:
+        return np.zeros(n, dtype=bool)
 
+    word_like = ((rstats[:, cv2.CC_STAT_WIDTH] >= min_w)
+                 & (rstats[:, cv2.CC_STAT_HEIGHT] <= max_h))
+    word_like[0] = False
+
+    h, w = ink.shape[:2]
+    # Sample each component at a pixel it actually owns (the centroid of a curved
+    # glyph can fall on background, which would read the wrong run).
+    ys = np.clip(stats[:, cv2.CC_STAT_TOP], 0, h - 1)
+    xs = np.clip(stats[:, cv2.CC_STAT_LEFT], 0, w - 1)
+    cy = np.clip(cents[:, 1].astype(int), 0, h - 1)
+    cx = np.clip(cents[:, 0].astype(int), 0, w - 1)
+    return word_like[rlab[cy, cx]] | word_like[rlab[ys, xs]]
+
+
+def remove_outside_content(gray: np.ndarray, dot_area: int = 400,
+                           thin_px: int = 16, keep_area: int = 12000,
+                           row_ink_max: float = 60.0
+                           ) -> tuple[np.ndarray, int]:
+    """Erase dots and black lines that sit on otherwise-empty rows of the page.
+
+    Isolation is judged along the component's OWN ROWS: how much other ink shares
+    the horizontal band it occupies. That measure, not a page-wide bounding box
+    and not a square neighbourhood, is what distinguishes dirt from content here.
+
+    A bounding box is not enough on its own. A single page number printed at the
+    foot stretches the box to 92% of the page height, which then shelters every
+    streak and speck above that number -- measured on a real page the box bottom
+    fell at y=2036 of 2217 while the noise ran from y=1752 downward, so all of it
+    counted as "inside" and survived.
+
+    A square window is worse than useless here: it mixes in vertical neighbours,
+    so a lone LINE of small print reads as sparse. Judging by a 240x240 window
+    erased the right-hand half of "Signature or Thumb impression of the Life to
+    be assured", silently truncating real content -- the caption's own density
+    was no higher than a speck's.
+
+    Rows separate the two cleanly, because text comes in lines that fill their
+    band while an artefact leaves its band empty. Mean other-ink per row,
+    measured on real pages:
+
+        signature-caption glyphs   minimum 274.6, median 343.0
+        bottom-of-page streaks     maximum  21.6, median  11.4
+
+    A 12x gap, so the 60 threshold sits far above every artefact measured and far
+    below the sparsest real text line. The page-wide box is still honoured too,
+    catching anything beyond the document edge even if it lands on a busy row.
+
+    Two shape gates keep this off content that merely stands alone:
+
+      * dots / blobs  - up to `dot_area` px (5x despeckle's limit), safe here
+        because there is no neighbouring text to confuse them with.
+      * black lines   - anything thinner than `thin_px` in one dimension, at any
+        length; the streaks run for hundreds of pixels, so thinness rather than
+        size is what marks them as a line.
+
+    `keep_area` protects a genuinely large solid object standing on its own (a
+    photo or stamp clear of the text block): a chunky mass that big is content.
+
+    Caveat: a page number alone on its rows is small enough to read as a dot and
+    isolated enough to be erased along with the dirt. That is a deliberate trade
+    -- a dropped page number is invisible in the filed output, whereas the
+    streaks are what shows up on screen.
+    """
     ink = _ink(gray)
-    n, lab, stats, _cents = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    n, lab, stats, cents = cv2.connectedComponentsWithStats(ink, connectivity=8)
     if n <= 1:
         return gray, 0
 
@@ -370,13 +426,30 @@ def remove_outside_content(gray: np.ndarray, dot_area: int = 400,
     hs = stats[:, cv2.CC_STAT_HEIGHT]
     areas = stats[:, cv2.CC_STAT_AREA]
 
-    # entirely outside the content box
-    outside = ((xs + ws <= x0) | (xs >= x1) | (ys + hs <= y0) | (ys >= y1))
+    # --- isolation: other ink sharing this component's rows --------------
+    row_ink = (ink > 0).sum(axis=1).astype(np.float64)
+    csum = np.concatenate([[0.0], np.cumsum(row_ink)])
+    band = csum[ys + hs] - csum[ys]              # all ink on those rows
+    per_row = (band - areas) / np.maximum(1, hs)  # ...excluding this component
+    isolated = per_row <= row_ink_max
+
+    # --- plus anything wholly beyond the document's own bounding box -----
+    box = content_bbox(gray)
+    if box is not None:
+        bx0, by0, bx1, by1 = box
+        outside = ((xs + ws <= bx0) | (xs >= bx1)
+                   | (ys + hs <= by0) | (ys >= by1))
+    else:
+        outside = np.zeros(n, dtype=bool)
+
     is_dot = areas <= dot_area
     is_line = np.minimum(ws, hs) <= thin_px
     chunky = (areas > keep_area) & (np.minimum(ws, hs) > thin_px)
 
-    kill = np.where(outside & (is_dot | is_line) & ~chunky)[0]
+    in_word = _word_mask(ink, stats, cents, n)
+
+    kill = np.where((isolated | outside) & (is_dot | is_line)
+                    & ~chunky & ~in_word)[0]
     kill = kill[kill != 0]
     if not kill.size:
         return gray, 0

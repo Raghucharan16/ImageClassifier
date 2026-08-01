@@ -86,14 +86,32 @@ PHOTO_CROP_TOP  = 0.28   # top fraction of JPG to include in photo crop
 PHOTO_CROP_RIGHT = 0.30  # right fraction of JPG to include in photo crop
 
 # Signature crops: the detector boxes the pen strokes only, but the printed
-# caption underneath ("Signature of the Proposer") is what identifies WHOSE
-# signature it is, so the box is grown downward to take it in. Every crop is
-# then letterboxed onto one standard canvas so the signature TIFF has uniform
-# pages instead of ragged per-detection sizes.
-SIG_PAD_BELOW   = 0.55   # extra height below the box, as a fraction of box height
-SIG_PAD_SIDE    = 0.06   # extra width each side, as a fraction of box width
+# caption underneath ("Signature or Thumb impression of the Life to be assured")
+# is what identifies WHOSE signature it is, so the box is grown to take it in.
+#
+# The caption is a full sentence and is much WIDER than the signature above it,
+# so padding by a fraction of the signature's own width truncates it -- that cut
+# "...of the Life to be assured" down to "...Thumb impressic". The horizontal
+# extent is therefore measured from the caption itself (see _caption_span)
+# rather than guessed from the box, and these fractions only seed the search.
+SIG_PAD_BELOW   = 0.85   # extra height below the box, as a fraction of box height
+SIG_PAD_SIDE    = 0.06   # minimum extra width each side, fraction of box width
 SIG_PAD_ABOVE   = 0.10   # small headroom so descenders/flourishes are not clipped
-SIG_CANVAS      = (760, 300)   # (width, height) px of every signature page
+SIG_CANVAS      = (1000, 300)  # (width, height) px of every signature page
+
+# Caption-span search: the caption sits within this fraction of the page width
+# either side of the signature, and words in it are separated by gaps no larger
+# than SIG_WORD_GAP px (anything bigger is a different column of the form).
+SIG_CAPTION_SEARCH = 0.42
+SIG_WORD_GAP       = 42
+# The search band starts this fraction of the box height ABOVE the box's bottom
+# edge. The detector's box usually already overlaps the caption -- measured on a
+# real page the caption baseline sat at y=703 inside a box ending at y=713 -- so
+# a band starting at the bottom edge begins BELOW the lettering and finds only
+# descenders, which is what truncated the sentence to "...Thumb impressic".
+# Reaching up also picks up the horizontal rule above the caption, which runs to
+# the same width and makes the span easier to follow.
+SIG_CAPTION_UP     = 0.35
 
 # In a frozen EXE the model is bundled into _MEIPASS; otherwise use the repo path
 if getattr(sys, "frozen", False):
@@ -125,6 +143,15 @@ def _clf():
 
 
 def _sig():
+    """Signature detector for this worker.
+
+    The detector is not fully reliable and cannot be made so by tuning: after a
+    few stray noise pixels near one signature were cleaned up by enhancement, it
+    stopped proposing a box for a signature that was still plainly there and
+    pixel-identical, and lowering the threshold to 0.2 did not bring the box
+    back -- the proposal was gone, not merely low-scoring. signatures_by_caption
+    exists to cover that case.
+    """
     s = getattr(_tls, "sig", None)
     if s is None:
         from signature_detector import SignatureDetector
@@ -328,25 +355,77 @@ def _classify_job(args: tuple[str, str]):
 
 
 # ---------------------------------------------------------------- signatures
-def _grow_signature_box(box, shape) -> tuple[int, int, int, int]:
-    """Expand a detected signature box to take in its printed caption.
+def _caption_span(gray: np.ndarray, x1: int, x2: int, y_from: int, y_to: int
+                  ) -> tuple[int, int]:
+    """Horizontal extent of the printed caption line under a signature.
+
+    Projects the caption band onto the x axis and walks outward from the
+    signature's own columns, absorbing further ink while the gaps stay smaller
+    than a word space. That is what lets the crop take in the whole sentence:
+    the caption runs well past both ends of the signature, so growing by a
+    multiple of the signature's width either clips the sentence or, if made
+    generous enough to always cover it, drags in the neighbouring form column.
+    Stopping at the first gap wider than a word space follows the real text
+    instead of assuming a width.
+
+    Returns (x0, x1) in page coordinates.
+    """
+    h, w = gray.shape[:2]
+    y_from = max(0, min(h - 1, y_from))
+    y_to = max(y_from + 1, min(h, y_to))
+    band = gray[y_from:y_to, :] < 128
+    if not band.any():
+        return x1, x2
+    cols = band.sum(axis=0) > 0
+
+    reach = int(w * SIG_CAPTION_SEARCH)
+    lo, hi = max(0, x1 - reach), min(w, x2 + reach)
+
+    left = x1
+    gap = 0
+    for x in range(x1 - 1, lo - 1, -1):
+        if cols[x]:
+            left, gap = x, 0
+        else:
+            gap += 1
+            if gap > SIG_WORD_GAP:
+                break
+
+    right = x2
+    gap = 0
+    for x in range(x2, hi):
+        if cols[x]:
+            right, gap = x + 1, 0
+        else:
+            gap += 1
+            if gap > SIG_WORD_GAP:
+                break
+    return left, right
+
+
+def _grow_signature_box(box, gray: np.ndarray) -> tuple[int, int, int, int]:
+    """Expand a detected signature box to take in its full printed caption.
 
     The detector boxes the pen strokes alone, but on Form 300 the line
-    identifying the signatory ("Signature of the Proposer", "Signature or thumb
-    impression of the Life Assured") is printed BELOW the signature, so a tight
-    crop yields an anonymous squiggle. The box is grown mostly downward to
-    capture that caption, with a little headroom above for tall flourishes and
-    a small side margin so the strokes are not clipped at the edges.
+    identifying the signatory ("Signature or Thumb impression of the Life to be
+    assured") is printed BELOW the signature, so a tight crop yields an anonymous
+    squiggle. The box grows downward to reach that line, then outward to the
+    line's measured width so the sentence is captured whole.
     """
-    h, w = shape[:2]
+    h, w = gray.shape[:2]
     x1, y1, x2, y2 = (int(v) for v in box[:4])
     bw, bh = max(1, x2 - x1), max(1, y2 - y1)
-    return (
-        max(0, x1 - int(bw * SIG_PAD_SIDE)),
-        max(0, y1 - int(bh * SIG_PAD_ABOVE)),
-        min(w, x2 + int(bw * SIG_PAD_SIDE)),
-        min(h, y2 + int(bh * SIG_PAD_BELOW)),
-    )
+
+    top = max(0, y1 - int(bh * SIG_PAD_ABOVE))
+    bottom = min(h, y2 + int(bh * SIG_PAD_BELOW))
+
+    # Measure the caption across a band that starts just inside the box bottom.
+    cx0, cx1 = _caption_span(gray, x1, x2,
+                             y2 - int(bh * SIG_CAPTION_UP), bottom)
+
+    left = min(max(0, x1 - int(bw * SIG_PAD_SIDE)), cx0)
+    right = max(min(w, x2 + int(bw * SIG_PAD_SIDE)), cx1)
+    return left, top, right, bottom
 
 
 # The printed line beneath a real signature on Form 300. This, not the size or
@@ -391,6 +470,79 @@ def has_signature_caption(crop: np.ndarray) -> bool:
         return False
 
 
+# How far above the caption line the signature sits, as a multiple of the
+# caption's own text height. A signature and the date line above it occupy
+# roughly three caption-heights; taking that much guarantees the strokes are
+# whole, and the crop is trimmed back to its own ink afterwards.
+SIG_ABOVE_CAPTION = 3.2
+
+# For the caption SEARCH every one of these must appear in the same OCR line.
+# Requiring both is what keeps the search precise: the page also carries an
+# empty "Signature : ___" field (matches "signatu" alone) and body text about
+# how "the thumb impression should be attested" (matches "impressi" alone), and
+# either one on its own produced a crop containing no signature at all. Only the
+# real caption -- "Signature or Thumb impression of the Life to be assured" --
+# carries both. Verification of a detector hit stays looser, since there the box
+# already localises actual ink.
+SIG_CAPTION_STRICT = ("signatu", "impressi")
+
+# A caption is a whole sentence, so it spans a good part of the page. Used with
+# the stem test to reject short labels that merely contain the words.
+SIG_CAPTION_MIN_W = 0.15
+
+
+def signatures_by_caption(page_path: str, max_side: int = 1600
+                          ) -> list[np.ndarray]:
+    """Locate signatures from their printed caption instead of the ONNX detector.
+
+    Used when the detector proposes nothing usable. The caption is a far steadier
+    anchor than the detector: it is printed, always present, and always in the
+    same place relative to the signature, whereas the detector silently dropped a
+    signature after unrelated specks near it were cleaned away.
+
+    OCR returns a box per text line, so the caption's line is found by matching
+    SIG_CAPTIONS against the recognised text, and the signature is then the
+    region directly ABOVE that box. The caption's own box also gives the exact
+    horizontal extent to use, which is what makes the sentence come out whole.
+    """
+    crops: list[np.ndarray] = []
+    try:
+        full = cv2.imread(page_path, cv2.IMREAD_GRAYSCALE)
+        if full is None:
+            full = np.array(Image.open(page_path).convert("L"))
+        h, w = full.shape[:2]
+        s = min(1.0, max_side / max(h, w))
+        small = cv2.resize(full, None, fx=s, fy=s,
+                           interpolation=cv2.INTER_AREA) if s < 1 else full
+
+        result, _ = _ocr().engine(np.stack([small] * 3, axis=-1))
+        if not result:
+            return crops
+
+        right_start = w // 2
+        for item in result:
+            box, text = item[0], item[1]
+            compact = "".join(ch for ch in str(text).lower() if ch.isalpha())
+            if not all(m in compact for m in SIG_CAPTION_STRICT):
+                continue
+            pts = np.asarray(box, dtype=np.float32) / max(s, 1e-6)
+            x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+            x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+            if (x2 - x1) < SIG_CAPTION_MIN_W * w:
+                continue          # too short to be the caption sentence
+            if (x1 + x2) / 2 < right_start:
+                continue          # left-hand box is the agent's, not the customer's
+            ch_ = max(1.0, y2 - y1)
+            top = int(max(0, y1 - ch_ * SIG_ABOVE_CAPTION))
+            crop = full[top:int(min(h, y2 + ch_ * 0.35)),
+                        int(max(0, x1 - 12)):int(min(w, x2 + 12))]
+            if crop.size:
+                crops.append(crop)
+    except Exception as exc:
+        logging.debug(f"caption-based signature search failed {page_path}: {exc}")
+    return crops
+
+
 def extract_right_signatures(page_path: str) -> list[np.ndarray]:
     """Signatures on right half only (customer box, not agent box on left).
 
@@ -409,12 +561,17 @@ def extract_right_signatures(page_path: str) -> list[np.ndarray]:
             box = d["box"]
             if (box[0] + box[2]) / 2 < right_start:
                 continue
-            x1, y1, x2, y2 = _grow_signature_box(box, full.shape)
+            x1, y1, x2, y2 = _grow_signature_box(box, full)
             img = full[y1:y2, x1:x2]
             if img.size and has_signature_caption(img):
                 crops.append(img)
     except Exception as e:
         logging.debug(f"sig detect failed {page_path}: {e}")
+
+    # The detector can silently omit a signature that is plainly present; fall
+    # back to finding it by its caption rather than losing it.
+    if not crops:
+        crops = signatures_by_caption(page_path)
     return crops
 
 
