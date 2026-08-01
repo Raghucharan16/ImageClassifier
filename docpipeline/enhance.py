@@ -464,8 +464,8 @@ def crop_hole_bands(gray: np.ndarray, bands, pad: int = 6,
 
 # ---------------------------------------------------------- scanner streaks
 def remove_streaks(gray: np.ndarray, max_width: int = 14, max_h_frac: float = 0.15,
-                   x_tol: float = 6.0, min_span: float = 0.10, min_blobs: int = 4,
-                   bin_w: int = 16, solo_span: float = 0.45,
+                   x_tol: float = 15.0, min_span: float = 0.10, min_blobs: int = 4,
+                   bin_w: int = 28, solo_span: float = 0.45,
                    row_neighbour: float = 0.0004) -> tuple[np.ndarray, int]:
     """Remove the dashed vertical lines a dirty scanner roller leaves down a page.
 

@@ -273,30 +273,24 @@ def save_signature_tif(crops: list[np.ndarray], out_path: str) -> int:
 
 
 # ---------------------------------------------------------------- page OCR/classify
-def classify_page(app_dir: str, f: str, max_side: int = 700,
-                  top_frac: float = 0.5):
-    """OCR + classify one enhanced page.
+def classify_page(app_dir: str, f: str, max_side: int = 1000):
+    """OCR + classify one enhanced page. Returns (filename, category, label).
 
-    Two-stage, cheapest-first:
+    The WHOLE page is read, at max_side=1000. Both of those matter and neither is
+    a free parameter to tune for speed:
 
-      1. OCR only the TOP `top_frac` of the page. Every document class in this
-         packet is identified by a header or title in its upper half -- the
-         Form-300 section headings, "Proposal Review Slip", "Medical Examiner's
-         Report", the UIDAI/Income-Tax issuer lines, bank passbook headers. Half
-         the pixels means roughly half the detected text boxes, and recognition
-         cost scales with box count, so this is a ~2x saving on the common case.
-      2. Only if the top half matches nothing, OCR the FULL page. Pages that
-         genuinely need this are the minority (continuation pages whose only
-         marker sits lower down), so the extra pass is paid rarely.
+      * Reading only the top of the page breaks the classifier. Several rules in
+        rules.py gate on total text length (`len(low) < 900`) to tell a small ID
+        card from a densely printed form page. Cropping to the top half roughly
+        halves the text, so form pages read as "short" and match the ID-card
+        rules -- that filed a Form-300 "KYC & PMLA" page into kyc.tif. It also
+        lets the loose _proposal_context catch-all win on a review slip's header
+        area and return early, filing review slips as proposal forms.
+      * Dropping to 700 px costs the dot-matrix review-slip header its
+        legibility, which is the signal _review_slip depends on.
 
-    Worst case is therefore top-half + full page; best and typical case is a
-    single half-page pass. Accuracy cannot regress relative to full-page OCR,
-    because anything the half-page pass fails to classify still gets the full
-    pass it would have had.
-
-    The image is first resized so its longest side is at most `max_side`
-    (700 px): that keeps keyword-match accuracy while roughly halving pixel
-    count versus 1000 px.
+    So the length thresholds in rules.py are calibrated against a full-page read
+    at this resolution; changing either side of that silently misclassifies.
     """
     p = os.path.join(app_dir, f)
     try:
@@ -312,24 +306,8 @@ def classify_page(app_dir: str, f: str, max_side: int = 700,
         # the ratio (not plain landscape) is the test.
         is_wide = (h / w) < WIDE_RATIO if w else False
 
-        rgb = np.stack([g] * 3, axis=-1)
-        clf = _clf()
-
-        # A wide strip is short: OCR it whole in one pass rather than halving it.
-        if is_wide:
-            text = _ocr().text_of(rgb)
-            cat, label, _ = clf.classify(text, is_wide=True)
-            return f, cat, label
-
-        cut = max(1, int(h * top_frac))
-        text = _ocr().text_of(rgb[:cut, :])
-        cat, label, _ = clf.classify(text, is_wide=False)
-        if cat != "unidentified":
-            return f, cat, label
-
-        # Top half was inconclusive -- read the whole page.
-        text = _ocr().text_of(rgb)
-        cat, label, _ = clf.classify(text, is_wide=False)
+        text = _ocr().text_of(np.stack([g] * 3, axis=-1))
+        cat, label, _ = _clf().classify(text, is_wide=is_wide)
         return f, cat, label
 
     except Exception as exc:
@@ -371,11 +349,54 @@ def _grow_signature_box(box, shape) -> tuple[int, int, int, int]:
     )
 
 
+# The printed line beneath a real signature on Form 300. This, not the size or
+# shape of the ink, is what makes a signature identifiable.
+# Matched against the caption with spaces/punctuation/DIGITS stripped, because
+# OCR of this small printed line is reliably imperfect: a real caption came back
+# as "are or Thumbimpressi0" -- space lost, trailing 'o' read as a zero. Stripping
+# non-letters turns that into "areorthumbimpressi", which these stems still hit.
+# "signatu" rather than "signat" on purpose: the form also prints "Designation",
+# and "designation" contains "signat" but not "signatu".
+SIG_CAPTIONS = ("signatu", "thumbimpress", "impressi")
+
+
+def has_signature_caption(crop: np.ndarray) -> bool:
+    """True when the crop carries a printed 'Signature / Thumb impression' line.
+
+    The signature MODEL detects handwriting, not signatures, so on a filled
+    Form 300 it fires on every pen mark: measured on real pages it returned the
+    date '2026', a phone number '9483471237', a handwritten name under "First
+    Name", 'M.B.A', and answers like 'No', 'NA' and 'Yes, satisfied'.
+
+    Geometry cannot separate those from the real thing -- 'Yes, satisfied' has a
+    larger maximum stroke (5222 px) than a genuine signature (3651 px), and the
+    widest-stroke fraction overlaps completely. What DOES separate them is
+    context: a real signature sits directly above a printed caption
+    ("Signature or Thumb impression of the Life to be assured"), and none of the
+    false positives do. _grow_signature_box already extends the box downward far
+    enough to take that line in, so reading the crop answers the question.
+
+    A crop that fails this test is dropped rather than guessed at: an empty
+    signature.tif is more useful than one holding the word 'No'.
+    """
+    try:
+        c = crop
+        if min(c.shape[:2]) < 60:      # help OCR on small crops
+            c = cv2.resize(c, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        txt = _ocr().text_of(np.stack([c] * 3, axis=-1)).lower()
+        compact = "".join(ch for ch in txt if ch.isalpha())
+        return any(m in compact for m in SIG_CAPTIONS)
+    except Exception as exc:
+        logging.debug(f"signature caption read failed: {exc}")
+        return False
+
+
 def extract_right_signatures(page_path: str) -> list[np.ndarray]:
     """Signatures on right half only (customer box, not agent box on left).
 
-    Each crop includes the printed caption below the signature and is taken
-    from the full-resolution page so strokes stay intact.
+    Each crop includes the printed caption below the signature, is verified
+    against that caption (see has_signature_caption), and is taken from the
+    full-resolution page so strokes stay intact.
     """
     det = _sig()
     crops = []
@@ -390,7 +411,7 @@ def extract_right_signatures(page_path: str) -> list[np.ndarray]:
                 continue
             x1, y1, x2, y2 = _grow_signature_box(box, full.shape)
             img = full[y1:y2, x1:x2]
-            if img.size:
+            if img.size and has_signature_caption(img):
                 crops.append(img)
     except Exception as e:
         logging.debug(f"sig detect failed {page_path}: {e}")
